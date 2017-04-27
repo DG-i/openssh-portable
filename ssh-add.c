@@ -58,6 +58,7 @@
 #include "rsa.h"
 #include "log.h"
 #include "sshkey.h"
+#include "crypto_api.h"
 #include "sshbuf.h"
 #include "authfd.h"
 #include "authfile.h"
@@ -65,6 +66,7 @@
 #include "misc.h"
 #include "ssherr.h"
 #include "digest.h"
+#include "readconf.h"
 
 /* argv0 */
 extern char *__progname;
@@ -92,6 +94,17 @@ static int lifetime = 0;
 
 /* User has to confirm key use */
 static int confirm = 0;
+
+/* Flag indicating whether debug mode is on.  May be set on the command line. */
+int debug_flag = 1;
+int log_level = SYSLOG_LEVEL_INFO;
+
+
+/*
+ * General data structure for command line options and options configurable
+ * in configuration files.  See readconf.h.
+ */
+Options options;
 
 /* we keep a cache of one passphrase */
 static char *pass = NULL;
@@ -331,6 +344,151 @@ add_file(int agent_fd, const char *filename, int key_only)
 }
 
 static int
+add_cert(int agent_fd, const char *filename)
+{
+	struct sshkey  *cert;
+	char *comment = NULL;
+	char  *certpath = NULL;
+	int r, ret = -1;
+	int had_identities = 0;
+	struct ssh_identitylist *idlist;
+	size_t i;
+	int version = 2;
+
+    xasprintf(&certpath, "%s", filename);
+	if ((r = sshkey_load_public(certpath, &cert, NULL)) != 0) {
+        fatal("Failed to load certificate \"%s\": %s",
+              certpath, ssh_err(r));
+	}
+	debug2("loaded certificate %s", filename);
+
+	if ((r = ssh_fetch_identitylist(agent_fd, version,
+	    &idlist)) != 0) {
+		if (r != SSH_ERR_AGENT_NO_IDENTITIES)
+			fprintf(stderr, "error fetching identities for "
+			    "protocol %d: %s\n", version, ssh_err(r));
+	}
+
+	for (i = 0; i < idlist->nkeys; i++) {
+		had_identities = 1;
+        debug3("\n\nLooping through identitys in agent, iteration: %zd", i);
+        debug("Processing id \"%s\"", idlist->comments[i]);
+		if (log_level >= SYSLOG_LEVEL_DEBUG3){
+            fprintf(stderr, "Matching identity  ");
+            if ((r = sshkey_write(idlist->keys[i],
+                                  stderr)) != 0) {
+                fprintf(stderr, "sshkey_write: %s\n",
+                        ssh_err(r));
+                
+                continue;
+            }
+            fprintf(stderr, "\n");
+        }
+        if (log_level >= SYSLOG_LEVEL_DEBUG3){
+            fprintf(stderr, "Against certificate ");
+            if ((r = sshkey_write(cert, stderr)) != 0) {
+                fprintf(stderr, "sshkey_write of cert: %s\n",
+                        ssh_err(r));
+            }
+            fprintf(stderr, "\n");
+        }
+
+		debug2("Type of cert: %s  \t\t\t\t Type of identity from agent: %s", sshkey_type(cert), sshkey_type(idlist->keys[i]) );
+
+		if (sshkey_equal_public(cert, idlist->keys[i]) ) {
+			debug2("Certificate matches identity from agent");
+
+
+            /* Graft Certificagte with private bits */
+            switch (cert->type) {
+                case KEY_RSA_CERT :
+                    /* initialize cert->rsa->iqmp,d,p,q */
+                    debug2("RSA-CERT");
+                    sshkey_add_private(cert);
+                    break;
+                    
+                case KEY_ED25519_CERT :
+                    debug2("ED25519-CERT");
+                    cert->ed25519_sk =  malloc(ED25519_SK_SZ);
+                    break;
+                case KEY_ECDSA_CERT:
+                    debug2("ECDSA-CERT");
+                    /* sshkey_add_private(cert); */
+                    /* don'tr know abouzt any smartcards doing ECDSA */
+                    fatal("ECDSA-CERT is not yet implemented");
+                    break;
+                case KEY_DSA_CERT:
+                    debug2("DSA-CERT");
+                    sshkey_add_private(cert);
+                    break;
+            }
+            
+            
+			if ((r = ssh_add_identity_constrained(agent_fd, cert, NULL,
+			    lifetime, confirm)) != 0) {
+				error("Certificate %s (%s) add failed: %s", certpath,
+				    cert->cert->key_id, ssh_err(r));
+				goto out;
+			}
+			fprintf(stderr, "Certificate added: %s (%s)\n", certpath,
+			    cert->cert->key_id);
+            ret = 0;
+			if (lifetime != 0)
+				fprintf(stderr, "Lifetime set to %d seconds\n", lifetime);
+			if (confirm != 0)
+				fprintf(stderr, "The user must confirm each use of the key\n");
+            /* Skip proceeing other entries*/
+            goto out;
+		} else {  
+			debug("Certificate does not match key in agent");
+		}
+		
+	}
+    fprintf(stderr, "Certificate does not match any identity from ssh-agent, concider usimng the CertificateFile option\n");
+
+ out:
+	free(certpath);
+	free(comment);
+	sshkey_free(cert);
+    ssh_free_identitylist(idlist);
+	return ret;
+}
+
+static int
+delete_cert(int agent_fd, const char *filename)
+{
+    struct sshkey  *cert;
+    char *comment = NULL;
+    char  *certpath = NULL;
+    int r, ret = -1;
+
+
+    xasprintf(&certpath, "%s", filename);
+    if ((r = sshkey_load_public(certpath, &cert, &comment)) != 0) {
+        if (r != SSH_ERR_SYSTEM_ERROR || errno != ENOENT)
+            fatal("Failed to load certificate \"%s\": %s",
+                  certpath, ssh_err(r));
+    }
+    debug2("loaded certificate %s", filename);
+    
+    /* initialize cert->rsa->iqmp,d,p,q with 0 */
+    /* sshkey_add_private(cert); */
+    
+    if ((r = ssh_remove_identity(agent_fd, cert)) == 0) {
+        fprintf(stderr, "Identity removed: %s (%s)\n", certpath,
+                comment);
+        ret = 0;
+    } else
+        fprintf(stderr, "Could not remove identity \"%s\": %s\n",
+                certpath, ssh_err(r));
+    
+    sshkey_free(cert);
+    free(certpath);
+    free(comment);
+    return ret;
+}
+
+static int
 update_card(int agent_fd, int add, const char *id)
 {
 	char *pin = NULL;
@@ -439,6 +597,21 @@ lock_agent(int agent_fd, int lock)
 	return (ret);
 }
 
+/* Process "-C" */
+static int
+do_cert(int agent_fd, int deleting, char *file)
+{
+	debug2("do_cert: %s", file );
+	if (deleting) {
+		if (delete_cert(agent_fd, file) == -1)
+			return -1;
+	} else {
+		if (add_cert(agent_fd, file) == -1)
+			return -1;
+	}
+	return 0;
+}
+
 static int
 do_file(int agent_fd, int deleting, int key_only, char *file)
 {
@@ -461,12 +634,14 @@ usage(void)
 	fprintf(stderr, "  -E hash     Specify hash algorithm used for fingerprints.\n");
 	fprintf(stderr, "  -L          List public key parameters of all identities.\n");
 	fprintf(stderr, "  -k          Load only keys and not certificates.\n");
+	fprintf(stderr, "  -C file     Use the following certificate\n");
 	fprintf(stderr, "  -c          Require confirmation to sign using identities\n");
 	fprintf(stderr, "  -t life     Set lifetime (in seconds) when adding identities.\n");
 	fprintf(stderr, "  -d          Delete identity.\n");
 	fprintf(stderr, "  -D          Delete all identities.\n");
 	fprintf(stderr, "  -x          Lock agent.\n");
 	fprintf(stderr, "  -X          Unlock agent.\n");
+	fprintf(stderr, "  -v          Verbose.\n");
 	fprintf(stderr, "  -s pkcs11   Add keys from PKCS#11 provider.\n");
 	fprintf(stderr, "  -e pkcs11   Remove keys provided by PKCS#11 provider.\n");
 }
@@ -478,6 +653,7 @@ main(int argc, char **argv)
 	extern int optind;
 	int agent_fd;
 	char *pkcs11provider = NULL;
+	char *certificateFile = NULL;
 	int r, i, ch, deleting = 0, ret = 0, key_only = 0;
 	int xflag = 0, lflag = 0, Dflag = 0;
 
@@ -494,6 +670,12 @@ main(int argc, char **argv)
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
+    /*
+     * Initialize "log" output.  Since we are the client all output
+     * goes to stderr
+     */
+    log_init(argv[0], SYSLOG_LEVEL_INFO, SYSLOG_FACILITY_USER, 1);
+    
 	/* First, get a connection to the authentication agent. */
 	switch (r = ssh_get_authentication_socket(&agent_fd)) {
 	case 0:
@@ -507,7 +689,7 @@ main(int argc, char **argv)
 		exit(2);
 	}
 
-	while ((ch = getopt(argc, argv, "klLcdDxXE:e:s:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "klLcdDvxXC:E:e:s:t:")) != -1) {
 		switch (ch) {
 		case 'E':
 			fingerprint_hash = ssh_digest_alg_by_name(optarg);
@@ -532,6 +714,9 @@ main(int argc, char **argv)
 		case 'c':
 			confirm = 1;
 			break;
+		case 'C':
+			certificateFile = optarg;
+			break;
 		case 'd':
 			deleting = 1;
 			break;
@@ -552,13 +737,22 @@ main(int argc, char **argv)
 				goto done;
 			}
 			break;
+		case 'v':
+                if (log_level == SYSLOG_LEVEL_INFO)
+                    log_level = SYSLOG_LEVEL_DEBUG1;
+                else {
+                    if (log_level >= SYSLOG_LEVEL_DEBUG1 &&
+                        log_level < SYSLOG_LEVEL_DEBUG3)
+                        log_level++;
+                }
+                break;
 		default:
 			usage();
 			ret = 1;
 			goto done;
 		}
 	}
-
+    
 	if ((xflag != 0) + (lflag != 0) + (Dflag != 0) > 1)
 		fatal("Invalid combination of actions");
 	else if (xflag) {
@@ -575,12 +769,16 @@ main(int argc, char **argv)
 		goto done;
 	}
 
+    /* reinit */
+    log_init(argv[0], log_level, SYSLOG_FACILITY_USER, 1);
+    debug2("log level is: %s", log_level_name(log_level));
+    
 	argc -= optind;
 	argv += optind;
 	if (pkcs11provider != NULL) {
 		if (update_card(agent_fd, !deleting, pkcs11provider) == -1)
 			ret = 1;
-		goto done;
+		goto addcert;
 	}
 	if (argc == 0) {
 		char buf[PATH_MAX];
@@ -615,6 +813,17 @@ main(int argc, char **argv)
 		}
 	}
 	clear_pass();
+    
+addcert:
+    /* process certificate passedc by -C [file] */
+    if (certificateFile != NULL) {
+        debug("using certificate from file: %s", certificateFile);
+        if (do_cert(agent_fd, deleting, certificateFile) == -1) {
+            ret = 1;
+            goto done;
+        }
+        ret = 0;
+    } 
 
 done:
 	ssh_close_authentication_socket(agent_fd);
